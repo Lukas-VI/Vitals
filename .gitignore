@@ -1,0 +1,27 @@
+.worktrees/
+.env.local.ps1
+.godot/
+.mono/
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+__pycache__/
+*.py[cod]
+# ALS / Lyra / UE exported asset data. See ASSET_LICENSE.md: these are not
+# covered by the MIT license and must not be committed or redistributed.
+assets/
+tests/**/Fixtures/
+
+# Downloaded release bundles
+*.zip
+SHA256SUMS.txt
+
+resource-bundles/
+artifacts/*
+!artifacts/.gdignore
+benchmark-results/*
+!benchmark-results/.gdignore

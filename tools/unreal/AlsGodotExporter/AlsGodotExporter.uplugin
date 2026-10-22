@@ -1,0 +1,25 @@
+{
+  "FileVersion": 3,
+  "Version": 2,
+  "VersionName": "2.0.0",
+  "FriendlyName": "ALS Godot Exporter",
+  "Description": "Deterministic ALS asset export commandlet for Godot.",
+  "Category": "Editor",
+  "CreatedBy": "Godot ALS",
+  "CanContainContent": false,
+  "EnabledByDefault": true,
+  "Installed": false,
+  "Plugins": [
+    { "Name": "ALS", "Enabled": true },
+    { "Name": "ControlRig", "Enabled": true },
+    { "Name": "RigVM", "Enabled": true }
+  ],
+  "Modules": [
+    {
+      "Name": "AlsGodotExporter",
+      "Type": "Editor",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": ["Win64"]
+    }
+  ]
+}

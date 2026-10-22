@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://okprp6ibcpq"]
+
+[ext_resource type="Script" uid="uid://b0oljr12d8xgl" path="res://src/Als.Godot/Locomotion/AlsDemoEntry.cs" id="1"]
+
+[node name="AlsDemo" type="Node" unique_id=1519965225]
+script = ExtResource("1")

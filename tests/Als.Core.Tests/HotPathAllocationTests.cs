@@ -1,0 +1,685 @@
+using System.Runtime.CompilerServices;
+using GodotAls.Core.Contracts;
+using GodotAls.Core.Actions;
+using GodotAls.Core.Curves;
+using GodotAls.Core.Events;
+using GodotAls.Core.Exchange;
+using GodotAls.Core.Locomotion;
+using GodotAls.Core.Pose;
+using GodotAls.Core.Sync;
+using GodotAls.Core.Transitions;
+
+namespace GodotAls.Core.Tests;
+
+[Collection(AllocationTestCollection.Name)]
+public sealed class HotPathAllocationTests
+{
+    [Fact]
+    public void EventAndExchangeHotPathDoesNotAllocateAfterWarmup()
+    {
+        var exchange = new AlsFrameExchange();
+
+        Run(exchange, 100);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        Run(exchange, 10_000);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void FullLocomotionEvaluateDoesNotAllocateAfterWarmup()
+    {
+        var input = P3TestInput.Grounded(
+            velocity: new System.Numerics.Vector3(2f, 0f, -4f),
+            acceleration: new System.Numerics.Vector3(1f, 0f, -2f),
+            rotationMode: AlsRotationMode.VelocityDirection,
+            characterYaw: 0.25f);
+        var allocated = MeasureConvenienceEvaluate(input);
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void ExplicitLocomotionEvaluateDoesNotAllocateAfterWarmup()
+    {
+        var input = P3TestInput.Grounded(
+            velocity: new System.Numerics.Vector3(2f, 0f, -4f),
+            acceleration: new System.Numerics.Vector3(1f, 0f, -2f),
+            rotationMode: AlsRotationMode.VelocityDirection,
+            characterYaw: 0.25f);
+        var resolved = AlsLocomotionCommandResolver.Resolve(input.Command, input.Stance);
+
+        var allocated = MeasureExplicitEvaluate(input, resolved);
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void ViewPoseEvaluateDoesNotAllocateAfterWarmup()
+    {
+        var input = P3TestInput.Grounded(
+            rotationMode: AlsRotationMode.Aiming,
+            characterYaw: 0.25f,
+            viewYaw: 0.4f,
+            aimYaw: 0.5f) with
+        {
+            CharacterTransform = System.Numerics.Matrix4x4.CreateRotationY(0.25f),
+        };
+
+        var allocated = MeasureViewPoseEvaluate(input);
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void TurnRotateSelectAndFinalizeDoesNotAllocateAfterWarmup()
+    {
+        var input = P3TestInput.Grounded(
+            rotationMode: AlsRotationMode.Aiming,
+            characterYaw: 0f,
+            aimYaw: 1.4f);
+        var state = AlsRuntimeState.CreateDefault();
+        state.Initialized = 1;
+        state.LocomotionState = AlsLocomotionState.Grounded;
+        state.ViewPose = new AlsViewPoseState(1.4f, 0f, 8f, 0.25f, 0.5f, 0f, 0f);
+        var view = new AlsViewPoseOutput(1.4f, 0f, 0.25f, 0.5f, 0.75f, 0f);
+        var settings = AlsTurnRotateSettings.CreateReference();
+
+        for (var index = 0; index < 10_000; index++)
+        {
+            RunTurnRotate(settings, input, view, ref state);
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 10_000; index++)
+        {
+            RunTurnRotate(settings, input, view, ref state);
+        }
+
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
+    [Fact]
+    public void FootPlacementEvaluateDoesNotAllocateAfterWarmup()
+    {
+        var leftHit = new AlsFootHit(
+            1, 1, new System.Numerics.Vector3(-0.2f, 0f, 0f),
+            System.Numerics.Vector3.UnitY, -1, System.Numerics.Vector3.Zero,
+            System.Numerics.Quaternion.Identity, 10, System.Numerics.Vector3.Zero);
+        var rightHit = leftHit with
+        {
+            Position = new System.Numerics.Vector3(0.2f, 0f, 0f),
+            ColliderId = 11,
+        };
+        var input = AlsFrameInput.CreateDefault(new AlsFrameIdentity(1, 0, 1), 1f / 60f) with
+        {
+            CharacterTransform = System.Numerics.Matrix4x4.Identity,
+            Floor = new AlsFloorSample(
+                1, System.Numerics.Vector3.UnitY, -1,
+                System.Numerics.Matrix4x4.Identity, System.Numerics.Vector3.Zero),
+            LeftFootHit = leftHit,
+            RightFootHit = rightHit,
+            CurrentDriveMode = AlsDriveMode.MotorDriven,
+        };
+
+        var allocated = MeasureFootPlacementEvaluate(input);
+
+        Assert.Equal(0, allocated);
+    }
+
+    private static void Run(AlsFrameExchange exchange, int iterations)
+    {
+        var buffer = new AlsEventBuffer();
+
+        for (var index = 0; index < iterations; index++)
+        {
+            var identity = new AlsFrameIdentity(index, 0, 1);
+            var input = AlsFrameInput.CreateDefault(identity, 1f / 60f);
+
+            exchange.PublishInput(input);
+            exchange.TryReadInput(identity, out _);
+
+            var result = AlsFrameResult.CreateDefault(identity);
+            result.TypedEvents.TryAdd(
+                new AlsAnimationEvent(
+                    1, -1, -1, -1, 0, 0, 0, 0, 0,
+                    0.25f, 1f, AlsTimelineEventKind.Generic,
+                    AlsAnimationEventPhase.Trigger, default));
+
+            exchange.PublishResult(result);
+            exchange.TryConsumeResult(identity, out _);
+
+            buffer.TryAdd(
+                new AlsAnimationEvent(
+                    2, -1, -1, -1, 0, 0, 0, 0, 0,
+                    0.5f, 1f, AlsTimelineEventKind.Generic,
+                    AlsAnimationEventPhase.Trigger, default));
+            buffer.Clear();
+        }
+    }
+
+    [Fact]
+    public void P5BuffersDoNotAllocateAfterWarmup()
+    {
+        var events = new AlsEventBuffer();
+        var outcomes = new AlsActionOutcomeBuffer();
+        var animationEvent = new AlsAnimationEvent(
+            1, 2, -1, 3, 1, 0, 0, 0, 0,
+            0.25f, 1f, AlsTimelineEventKind.Generic,
+            AlsAnimationEventPhase.Trigger, default);
+        var outcome = new AlsActionOutcome(1, 2, 1, AlsActionResultCode.Accepted);
+
+        for (var index = 0; index < 100; index++)
+        {
+            ExerciseP5Buffers(ref events, ref outcomes, animationEvent, outcome);
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 10_000; index++)
+        {
+            ExerciseP5Buffers(ref events, ref outcomes, animationEvent, outcome);
+        }
+
+        Assert.Equal(0, GC.GetAllocatedBytesForCurrentThread() - before);
+    }
+
+    [Fact]
+    public void WarmEvaluationAllocatesZeroBytes()
+    {
+        AlsCurveKey[] keys =
+        [
+            new(0f, 1f, 0f, 0f, AlsCurveInterpolationMode.Linear),
+            new(1f, 3f, 0f, 0f, AlsCurveInterpolationMode.Linear),
+            new(0f, -1f, 0f, 0f, AlsCurveInterpolationMode.Constant),
+        ];
+        AlsCurveBinding[] bindings =
+        [
+            new(17, 0, 2, 1f, 1, 0),
+            new(31, 2, 1, 1f, 1, 0),
+        ];
+        AlsCurveBlendSample[] samples =
+        [
+            new(0, 0, 0.25f, 0.75f),
+            new(1, 0, 0.25f, 0.25f),
+        ];
+
+        ExerciseCurveRuntime(keys, bindings, samples, 100, out _, out _);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExerciseCurveRuntime(keys, bindings, samples, 10_000, out var finalCycle, out var checksum);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(0, allocated);
+        Assert.Equal(1_250L, finalCycle);
+        Assert.True(float.IsFinite(checksum));
+    }
+
+    [Fact]
+    public void SyncEvaluationAllocatesZeroBytesAfterWarmup()
+    {
+        AlsSyncMarkerDefinition[] markers =
+        [
+            new(101, 11, 10, 0, 0, 0.2f), new(102, 12, 10, 1, 0, 0.6f),
+            new(201, 11, 20, 0, 0, 1.4f), new(202, 12, 20, 1, 0, 0.6f),
+        ];
+        AlsSyncMemberBinding[] members = [new(1, 10, 1f, 1, 1), new(1, 20, 2f, 1, 1)];
+        AlsSyncPlayback[] playbacks = [new(1, 10, 1, 0.2d, 0.4d, 1f), new(2, 20, 1, 0.1d, 0.3d, 0.5f)];
+        var mapped = new AlsSyncMappedPlayback[2];
+        var group = new AlsSyncGroupBinding(1, 0, 2, 11, 12);
+
+        ExerciseSyncRuntime(markers, group, members, playbacks, mapped, 100);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExerciseSyncRuntime(markers, group, members, playbacks, mapped, 10_000);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void TimelineAndCommittedNotifyHotPathsAllocateZeroBytesAfterWarmup()
+    {
+        AlsTimelineEventDefinition[] definitions =
+        [
+            new(
+                1, 10, -1, 0, AlsTimelineSourceKind.Animation, 0, 0, 0,
+                0f, 0f, 0f, AlsTimelineEventKind.Generic,
+                AlsTimelineTickMode.Queued, default),
+        ];
+        AlsTimelinePlayback[] playbacks =
+        [
+            new(0, 10, -1, -1, 1, 0d, 0d, 0d, 0d, 1f, 1f,
+                AlsActionResultCode.None, 0, 1, 0),
+        ];
+        var cursors = new[] { AlsTimelineCursor.CreateDefault() };
+        var authorities = Array.Empty<AlsTimelineAuthorityState>();
+        var owners = new[] { AlsNotifyStateOwnership.CreateDefault() };
+        var scratch = new AlsTimelineOccurrence[AlsEventBuffer.Capacity];
+        var begin = new AlsAnimationEvent(
+            2, 10, -1, 0, 1, 0, 1, 0, 0, 0f, 1f,
+            AlsTimelineEventKind.Generic, AlsAnimationEventPhase.Begin, default);
+        var end = begin with { Phase = AlsAnimationEventPhase.End };
+
+        ExerciseTimelineAndMirror(
+            definitions, playbacks, cursors, authorities, owners, scratch, begin, end, 100);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExerciseTimelineAndMirror(
+            definitions, playbacks, cursors, authorities, owners, scratch, begin, end, 10_000);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void DynamicTransitionAdvanceAndQueueAllocateZeroBytesAfterWarmup()
+    {
+        var binding = new AlsDynamicTransitionBinding(
+            7,
+            9,
+            new AlsDynamicTransitionClipBinding(10, 100, 10f),
+            new AlsDynamicTransitionClipBinding(11, 100, 10f),
+            new AlsDynamicTransitionClipBinding(12, 100, 10f),
+            new AlsDynamicTransitionClipBinding(13, 100, 10f),
+            0.5f,
+            0.2f,
+            1f,
+            2);
+        var input = new AlsDynamicTransitionInput(
+            AlsStance.Standing,
+            1f,
+            System.Numerics.Vector3.UnitX,
+            System.Numerics.Vector3.Zero,
+            1,
+            System.Numerics.Vector3.Zero,
+            System.Numerics.Vector3.Zero,
+            0);
+
+        ExerciseDynamicTransition(binding, input, 100);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExerciseDynamicTransition(binding, input, 10_000);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(0, allocated);
+    }
+
+    [Fact]
+    public void ActionPlayerRequestAdvanceAndEarlyBlendOutAllocateZeroBytesAfterWarmup()
+    {
+        AlsActionDefinition[] definitions =
+        [
+            new(100, 1, 2, 10, 1000, 2f, 3, 10, 5, 1f, 0.25f, 1, 0),
+        ];
+        AlsActionSectionBinding[] sections = [new(10, 10, -1, 0f, 2f)];
+        AlsActionSegmentBinding[] segments = [new(200, 10, 3, 20, 300, 0f, 2f, 0f, 2f, 1f, 1)];
+        AlsTimelineEventDefinition[] timeline =
+        [
+            new(1, 1000, 10, 100, AlsTimelineSourceKind.Montage, 0, 0, 0,
+                0f, 1f, 0f, AlsTimelineEventKind.EarlyBlendOut,
+                AlsTimelineTickMode.Queued,
+                new AlsCompactEventPayload(0, 0, 0, 0, 0.1f, 1, AlsActionResultCode.None)),
+        ];
+        var slices = new AlsActionTraversalSlice[AlsActionPlayer.TraversalCapacity];
+
+        ExerciseActionPlayer(definitions, sections, segments, timeline, slices, 100);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        ExerciseActionPlayer(definitions, sections, segments, timeline, slices, 10_000);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Equal(0, allocated);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void ExerciseCurveRuntime(
+        AlsCurveKey[] keys,
+        AlsCurveBinding[] bindings,
+        AlsCurveBlendSample[] samples,
+        int iterations,
+        out long finalCycle,
+        out float checksum)
+    {
+        var cycle = 0L;
+        var time = 0f;
+        var sum = 0f;
+        for (var index = 0; index < iterations; index++)
+        {
+            if (!AlsCurveRuntime.TrySample(
+                    bindings[0], keys, 0, 0.75f, out var sampled, out var failure) ||
+                failure != AlsP5FailureCode.None ||
+                !AlsCurveRuntime.TryBlend(
+                    bindings, keys, samples, out var blended, out failure) ||
+                failure != AlsP5FailureCode.None ||
+                !AlsCurveRuntime.TryBlendAdditiveToDefault(
+                    1f, 0f, 2f, bindings, keys, samples, out var additive, out failure) ||
+                failure != AlsP5FailureCode.None ||
+                !AlsCurveRuntime.TryAdvancePlaybackTime(
+                    1f, 1, cycle, time, 0.125f, 1f,
+                    out cycle, out time, out failure) ||
+                failure != AlsP5FailureCode.None)
+            {
+                throw new InvalidOperationException("Curve runtime allocation probe failed.");
+            }
+
+            sum += sampled + blended + additive + time;
+        }
+
+        finalCycle = cycle;
+        checksum = sum;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void ExerciseSyncRuntime(
+        AlsSyncMarkerDefinition[] markers,
+        in AlsSyncGroupBinding group,
+        AlsSyncMemberBinding[] members,
+        AlsSyncPlayback[] playbacks,
+        AlsSyncMappedPlayback[] mapped,
+        int iterations)
+    {
+        for (var index = 0; index < iterations; index++)
+        {
+            if (!AlsSyncRuntime.TryEvaluateGroup(
+                    markers, group, members, playbacks, 0.2d, mapped,
+                    out var count, out _, out var failure) ||
+                count != 2 || failure != AlsP5FailureCode.None)
+            {
+                throw new InvalidOperationException("Sync runtime allocation probe failed.");
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void ExerciseTimelineAndMirror(
+        AlsTimelineEventDefinition[] definitions,
+        AlsTimelinePlayback[] playbacks,
+        AlsTimelineCursor[] cursors,
+        AlsTimelineAuthorityState[] authorities,
+        AlsNotifyStateOwnership[] owners,
+        AlsTimelineOccurrence[] scratch,
+        in AlsAnimationEvent begin,
+        in AlsAnimationEvent end,
+        int iterations)
+    {
+        var identity = new AlsFrameIdentity(1, 1, 1);
+        for (var index = 0; index < iterations; index++)
+        {
+            cursors[0] = AlsTimelineCursor.CreateDefault();
+            owners[0] = AlsNotifyStateOwnership.CreateDefault();
+            var nextToken = 1UL;
+            var events = new AlsEventBuffer();
+            if (!AlsTimelineRuntime.TryEvaluate(
+                    definitions, playbacks, 1, 0d, 0d,
+                    cursors, authorities, owners, ref nextToken, scratch,
+                    ref events, out var failure) ||
+                failure != AlsP5FailureCode.None ||
+                events.Count != 1)
+            {
+                throw new InvalidOperationException("Timeline allocation probe failed.");
+            }
+
+            var mirror = new AlsCommittedNotifyStateBuffer();
+            if (!mirror.TryApply(begin) || !mirror.TryApply(end))
+            {
+                throw new InvalidOperationException("Mirror apply allocation probe failed.");
+            }
+
+            if (!mirror.TryApply(begin))
+            {
+                throw new InvalidOperationException("Mirror synthetic allocation probe setup failed.");
+            }
+
+            var synthetic = new AlsEventBuffer();
+            if (!mirror.TryAppendSyntheticEnds(
+                    AlsActionResultCode.InterruptedByLifecycle, identity, ref synthetic) ||
+                synthetic.Count != 1)
+            {
+                throw new InvalidOperationException("Mirror synthetic allocation probe failed.");
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void ExerciseDynamicTransition(
+        in AlsDynamicTransitionBinding binding,
+        in AlsDynamicTransitionInput input,
+        int iterations)
+    {
+        var state = AlsDynamicTransitionState.CreateDefault();
+        for (var index = 0; index < iterations; index++)
+        {
+            if (!AlsDynamicTransitionRuntime.TryAdvance(
+                    binding, 0.01f, state, out state, out _, out var playback, out var failure) ||
+                failure != AlsP5FailureCode.None ||
+                !AlsDynamicTransitionRuntime.TryQueue(
+                    binding, input, playback.CooldownBlockedThisFrame, state,
+                    out state, out _, out failure) ||
+                failure != AlsP5FailureCode.None)
+            {
+                throw new InvalidOperationException("Dynamic transition allocation probe failed.");
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void ExerciseActionPlayer(
+        AlsActionDefinition[] definitions,
+        AlsActionSectionBinding[] sections,
+        AlsActionSegmentBinding[] segments,
+        AlsTimelineEventDefinition[] timeline,
+        AlsActionTraversalSlice[] slices,
+        int iterations)
+    {
+        var state = AlsActionPlayerState.CreateDefault();
+        for (var index = 0; index < iterations; index++)
+        {
+            var request = new AlsActionRequest(
+                index + 1, AlsActionCommand.Start, 10, 10, 5, 7);
+            var sliceCount = 0;
+            var outcomes = new AlsActionOutcomeBuffer();
+            if (!AlsActionPlayer.TryApplyRequest(
+                    definitions, sections, segments, 7, 0, request, state,
+                    slices, ref sliceCount, ref outcomes, out state, out _, out var failure) ||
+                failure != AlsP5FailureCode.None ||
+                !AlsActionPlayer.TryAdvance(
+                    definitions, sections, segments, 0.1d, state,
+                    slices, ref sliceCount, ref outcomes, out state, out _, out failure) ||
+                failure != AlsP5FailureCode.None ||
+                !AlsActionPlayer.TryInterruptEarlyBlendOut(
+                    definitions, sections, segments, timeline, 100, 200,
+                    slices[sliceCount - 1].CurrentMontageTime, 1f,
+                    1, AlsTimelineLocomotionMode.Grounded,
+                    AlsTimelineRotationMode.VelocityDirection, AlsTimelineStance.Standing,
+                    state, slices, sliceCount, ref outcomes, out state, out _, out failure) ||
+                failure != AlsP5FailureCode.None || outcomes.Count != 2 || state.Playing != 0)
+            {
+                throw new InvalidOperationException("Action player allocation probe failed.");
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void ExerciseP5Buffers(
+        ref AlsEventBuffer events,
+        ref AlsActionOutcomeBuffer outcomes,
+        in AlsAnimationEvent animationEvent,
+        in AlsActionOutcome outcome)
+    {
+        for (var eventIndex = 0; eventIndex < AlsEventBuffer.Capacity; eventIndex++)
+        {
+            if (!events.TryAdd(animationEvent with { EventId = eventIndex }))
+            {
+                throw new InvalidOperationException("Event buffer fill failed.");
+            }
+        }
+
+        if (events[0].EventId != 0 ||
+            events[AlsEventBuffer.Capacity - 1].EventId != AlsEventBuffer.Capacity - 1 ||
+            events.TryAdd(animationEvent))
+        {
+            throw new InvalidOperationException("Event buffer read or overflow contract failed.");
+        }
+
+        var eventCopy = events;
+        events.Clear();
+        if (eventCopy.Count != AlsEventBuffer.Capacity || eventCopy[1].EventId != 1)
+        {
+            throw new InvalidOperationException("Event buffer copy contract failed.");
+        }
+
+        if (!outcomes.TryAdd(outcome) ||
+            !outcomes.TryAdd(outcome with { RequestId = outcome.RequestId + 1 }) ||
+            outcomes[0] != outcome ||
+            outcomes.TryAdd(outcome))
+        {
+            throw new InvalidOperationException("Outcome buffer contract failed.");
+        }
+
+        var outcomeCopy = outcomes;
+        outcomes.Clear();
+        if (outcomeCopy.Count != AlsActionOutcomeBuffer.Capacity || outcomeCopy[1].RequestId != outcome.RequestId + 1)
+        {
+            throw new InvalidOperationException("Outcome buffer copy contract failed.");
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static long MeasureConvenienceEvaluate(AlsFrameInput input)
+    {
+        var state = new AlsRuntimeState();
+        var result = new AlsFrameResult();
+
+        for (var index = 0; index < 10_000; index++)
+        {
+            AlsLocomotionModel.Evaluate(
+                input,
+                ref state,
+                ref result,
+                P3TestSettings.Reference);
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 10_000; index++)
+        {
+            AlsLocomotionModel.Evaluate(
+                input,
+                ref state,
+                ref result,
+                P3TestSettings.Reference);
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static long MeasureExplicitEvaluate(
+        AlsFrameInput input,
+        AlsResolvedLocomotionCommand resolved)
+    {
+        var state = new AlsRuntimeState();
+        var result = new AlsFrameResult();
+
+        for (var index = 0; index < 10_000; index++)
+        {
+            AlsLocomotionModel.Evaluate(
+                input,
+                resolved,
+                ref state,
+                ref result,
+                P3TestSettings.Reference);
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 10_000; index++)
+        {
+            AlsLocomotionModel.Evaluate(
+                input,
+                resolved,
+                ref state,
+                ref result,
+                P3TestSettings.Reference);
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static long MeasureViewPoseEvaluate(AlsFrameInput input)
+    {
+        var state = new AlsRuntimeState { Initialized = 1 };
+        var settings = AlsViewPoseSettings.CreateDefault();
+
+        for (var index = 0; index < 10_000; index++)
+        {
+            if (!AlsViewPoseModel.TryEvaluate(
+                    settings, input, state, out state, out _, out _))
+            {
+                throw new InvalidOperationException("View pose warmup failed.");
+            }
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 10_000; index++)
+        {
+            if (!AlsViewPoseModel.TryEvaluate(
+                    settings, input, state, out state, out _, out _))
+            {
+                throw new InvalidOperationException("View pose measurement failed.");
+            }
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static long MeasureFootPlacementEvaluate(AlsFrameInput input)
+    {
+        var state = AlsRuntimeState.CreateDefault();
+        state.Initialized = 1;
+        state.LocomotionState = AlsLocomotionState.Grounded;
+        state.LeftFootProbeOrigin = new System.Numerics.Vector3(-0.2f, 0.13f, 0f);
+        state.RightFootProbeOrigin = new System.Numerics.Vector3(0.2f, 0.13f, 0f);
+        var settings = AlsFootPlacementSettings.CreateReference();
+
+        for (var index = 0; index < 10_000; index++)
+        {
+            if (!AlsFootPlacementModel.TryEvaluate(
+                    settings, input, 1f, 1f, 1f, 1f, state,
+                    out state, out _, out _))
+            {
+                throw new InvalidOperationException("Foot placement warmup failed.");
+            }
+        }
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 10_000; index++)
+        {
+            if (!AlsFootPlacementModel.TryEvaluate(
+                    settings, input, 1f, 1f, 1f, 1f, state,
+                    out state, out _, out _))
+            {
+                throw new InvalidOperationException("Foot placement measurement failed.");
+            }
+        }
+
+        return GC.GetAllocatedBytesForCurrentThread() - before;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining | MethodImplOptions.AggressiveOptimization)]
+    private static void RunTurnRotate(
+        in AlsTurnRotateSettings settings,
+        in AlsFrameInput input,
+        in AlsViewPoseOutput view,
+        ref AlsRuntimeState state)
+    {
+        if (!AlsTurnRotateModel.TrySelectAndAdvance(
+                settings, input, view, state, out state, out var selection, out _) ||
+            !AlsTurnRotateModel.TryFinalizeYaw(selection, -1f, -0.5f, out _, out _))
+        {
+            throw new InvalidOperationException("Turn/rotate hot path failed.");
+        }
+    }
+}

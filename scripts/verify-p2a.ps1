@@ -1,0 +1,315 @@
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$EngineRoot,
+
+    [Parameter(Mandatory = $true)]
+    [string]$UnrealProject,
+
+    [string]$ContentRoot = '/Game/AdvancedLocomotionV4',
+
+    [string]$Output = '',
+
+    [string]$BuildScript = (Join-Path $PSScriptRoot 'build-als-exporter.ps1'),
+
+    [string]$CommandletName = 'AlsGodotExport'
+)
+
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'unreal-version-functions.ps1')
+. (Join-Path $PSScriptRoot 'p2a-publication-functions.ps1')
+
+$invalidContentRootSegment = @($ContentRoot.Substring([Math]::Min(6, $ContentRoot.Length)).Split('/') |
+    Where-Object { $_ -in @('', '.', '..') }).Count -gt 0
+if ($ContentRoot -cnotmatch '^/Game/[^/]+(?:/[^/]+)*$' -or
+    $ContentRoot.Contains('\') -or $invalidContentRootSegment) {
+    throw "ContentRoot must be a canonical Unreal content path below /Game/: $ContentRoot"
+}
+
+[void](Get-AlsSupportedEngineVersion -EngineRoot $EngineRoot)
+$readyMarker = 'GODOT_ALS_EXPORTER_READY'
+
+$repositoryRoot = (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
+$artifactsPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path (Join-Path $repositoryRoot 'artifacts') -Label 'ArtifactsPath'
+if ([string]::IsNullOrWhiteSpace($Output)) {
+    $Output = Join-Path $repositoryRoot 'assets\generated\als_v4'
+}
+$canonicalPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path ([IO.Path]::GetFullPath($Output)) -Label 'CanonicalRoot'
+[void](Assert-AlsP2aCanonicalPublicationRoot -RepositoryRoot $repositoryRoot -CanonicalRoot $canonicalPath)
+$publicationPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path (Join-Path $artifactsPath 'p2a-publication') -Label 'PublicationPath'
+$outputPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path (Join-Path $publicationPath 'canonical-candidate') -Label 'CandidateRoot'
+$determinismPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path (Join-Path $artifactsPath 'p2a-determinism\als_v4') -Label 'DeterminismRoot'
+$canonicalBackupPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path (Join-Path $publicationPath 'als_v4.canonical.backup') -Label 'CanonicalBackupRoot'
+$journalPath = Resolve-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot `
+    -Path (Join-Path $publicationPath 'transaction.json') -Label 'JournalPath'
+
+$publicationPaths = @{
+    CanonicalRoot = $canonicalPath; CandidateRoot = $outputPath; DeterminismRoot = $determinismPath
+    CanonicalBackupRoot = $canonicalBackupPath; JournalPath = $journalPath
+}
+Assert-AlsP2aPublicationPathTopology -Paths $publicationPaths
+Repair-AlsP2aPublication -RepositoryRoot $repositoryRoot -JournalPath $journalPath
+Invoke-AlsP2aStagingWorkflow -RepositoryRoot $repositoryRoot -CandidateRoot $outputPath `
+    -DeterminismRoot $determinismPath -Action {
+    foreach ($backup in @($canonicalBackupPath)) {
+        if (Test-Path -LiteralPath $backup) {
+            throw "P2A publication has orphaned backup residue without a recovery journal: $backup"
+        }
+    }
+    foreach ($staging in @($outputPath, $determinismPath)) {
+        Remove-AlsRepositoryDescendantPath -RepositoryRoot $repositoryRoot -Path $staging -Label 'stale P2A staging'
+    }
+
+function Assert-P2AV2Manifest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Manifest,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    if ($null -eq $Manifest.PSObject.Properties['schemaVersion'] -or $Manifest.schemaVersion -ne 2) {
+        throw "$Label manifest schemaVersion is not 2."
+    }
+    if ($null -eq $Manifest.PSObject.Properties['exporterVersion'] -or
+        [string]::IsNullOrWhiteSpace([string]$Manifest.exporterVersion)) {
+        throw "$Label manifest exporterVersion is missing."
+    }
+    if (@($Manifest.animations | Where-Object { @($_.metadata.timeline).Count -gt 0 }).Count -eq 0) {
+        throw "$Label manifest contains no Sequence timeline entries."
+    }
+    if (@($Manifest.montages | Where-Object { @($_.metadata.timeline).Count -gt 0 }).Count -eq 0) {
+        throw "$Label manifest contains no Montage timeline entries."
+    }
+
+    $allTimelineEntries = @()
+    $allSyncMarkers = @()
+    foreach ($animationAsset in @($Manifest.animations) + @($Manifest.montages)) {
+        $allTimelineEntries += @($animationAsset.metadata.timeline)
+    }
+    foreach ($animationAsset in @($Manifest.animations)) {
+        $allSyncMarkers += @($animationAsset.metadata.syncMarkers)
+    }
+    if ($allSyncMarkers.Count -eq 0) {
+        throw "$Label manifest contains no sync markers."
+    }
+    if (@($allTimelineEntries | Where-Object { $_.kind -cne 'Generic' }).Count -eq 0) {
+        throw "$Label manifest contains no typed timeline events or actions."
+    }
+}
+
+$resolvedBuildScript = [IO.Path]::GetFullPath($BuildScript)
+if (-not (Test-Path -LiteralPath $resolvedBuildScript -PathType Leaf)) {
+    throw "Build script does not exist: $resolvedBuildScript"
+}
+
+Write-Host 'P2A: building the exporter and running its UE ready check...'
+$outputLines = & $resolvedBuildScript -EngineRoot $EngineRoot -UnrealProject $UnrealProject 2>&1
+$outputLines | ForEach-Object { Write-Host $_ }
+if ($LASTEXITCODE -ne 0) {
+    throw "P2A build gate failed with exit code $LASTEXITCODE."
+}
+
+if (-not (($outputLines | Out-String).Contains($readyMarker, [StringComparison]::Ordinal))) {
+    throw "P2A ready marker was not found: $readyMarker"
+}
+
+Write-Host 'GODOT_ALS_P2A_READY'
+
+[void](New-Item -ItemType Directory -Path $artifactsPath -Force)
+$godotIgnorePath = Join-Path $artifactsPath '.gdignore'
+if (-not (Test-Path -LiteralPath $godotIgnorePath -PathType Leaf)) {
+    [IO.File]::WriteAllText(
+        $godotIgnorePath,
+        "# Generated build and determinism artifacts are not Godot project resources.`n",
+        [Text.UTF8Encoding]::new($false))
+}
+$editorCommand = Join-Path ([IO.Path]::GetFullPath($EngineRoot)) 'Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
+$projectHashBefore = (Get-FileHash -LiteralPath $UnrealProject -Algorithm SHA256).Hash
+
+Write-Host 'P2A: checking the export plan and metadata...'
+$dryRunOutput = & $editorCommand $UnrealProject "-run=$CommandletName" -DryRun "-Output=$outputPath" "-ContentRoot=$ContentRoot" -unattended -nop4 -nosplash -nullrhi -nosound 2>&1
+$dryRunOutput | ForEach-Object { Write-Host $_ }
+if ($LASTEXITCODE -ne 0) {
+    throw "P2A dry-run failed with exit code $LASTEXITCODE."
+}
+
+$projectHashAfter = (Get-FileHash -LiteralPath $UnrealProject -Algorithm SHA256).Hash
+if ($projectHashBefore -ne $projectHashAfter) {
+    throw 'The exporter modified the source .uproject file.'
+}
+
+$planPath = Join-Path $outputPath 'export_plan.json'
+if (-not (Test-Path -LiteralPath $planPath -PathType Leaf)) {
+    throw "Dry-run export plan does not exist: $planPath"
+}
+
+$plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+$requiredKinds = @('Skeleton', 'SkeletalMesh', 'StaticMesh', 'AnimationSequence', 'AnimMontage', 'PhysicsAsset', 'Texture', 'Blueprint')
+$actualKinds = @($plan.assets | ForEach-Object { $_.kind } | Sort-Object -Unique)
+foreach ($kind in $requiredKinds) {
+    if ($kind -notin $actualKinds) {
+        throw "Dry-run plan does not contain required asset kind: $kind"
+    }
+}
+if (-not (@('BlendSpace', 'AimOffset') | Where-Object { $_ -in $actualKinds })) {
+    throw 'Dry-run plan contains neither BlendSpace nor AimOffset.'
+}
+if (-not (@('Material', 'MaterialInstance') | Where-Object { $_ -in $actualKinds })) {
+    throw 'Dry-run plan contains neither Material nor MaterialInstance.'
+}
+
+$excludedPattern = '/(Audio|Environment|Levels|UI|AI|GameModes)/'
+$excludedAssets = @($plan.assets | Where-Object { $_.objectPath -match $excludedPattern })
+if ($excludedAssets.Count -ne 0) {
+    throw "Dry-run plan contains $($excludedAssets.Count) excluded assets."
+}
+
+$ids = @($plan.assets | ForEach-Object { $_.id })
+$sortedIds = @($ids | Sort-Object -CaseSensitive)
+if (($ids -join "`n") -cne ($sortedIds -join "`n")) {
+    throw 'Dry-run plan assets are not sorted by stable ID.'
+}
+
+$planMarker = 'GODOT_ALS_P2A_PLAN_OK assets='
+if (-not (($dryRunOutput | Out-String).Contains($planMarker, [StringComparison]::Ordinal))) {
+    throw "P2A plan marker was not found: $planMarker"
+}
+
+Write-Host "GODOT_ALS_P2A_DRY_RUN_OK assets=$($plan.summary.assetCount) exportable=$($plan.summary.exportableCount)"
+
+$partialManifestPath = Join-Path $outputPath 'partial\als_manifest.partial.json'
+if (-not (Test-Path -LiteralPath $partialManifestPath -PathType Leaf)) {
+    throw "Dry-run partial manifest does not exist: $partialManifestPath"
+}
+$manifest = Read-AlsP2aManifestJson -ManifestPath $partialManifestPath -Label 'Partial'
+Assert-P2AV2Manifest -Manifest $manifest -Label 'Partial'
+$allBoneNames = @($manifest.skeletons | ForEach-Object { $_.metadata.bones } | ForEach-Object { $_.name })
+foreach ($boneName in @('root', 'pelvis', 'foot_l', 'foot_r')) {
+    if ($boneName -notin $allBoneNames) {
+        throw "Partial manifest does not contain required bone: $boneName"
+    }
+}
+foreach ($skeleton in @($manifest.skeletons)) {
+    if ($skeleton.metadata.restPoseHash -notmatch '^[0-9a-f]{40}$') {
+        throw "Skeleton metadata has no valid rest pose hash: $($skeleton.objectPath)"
+    }
+    if ($null -eq $skeleton.metadata.PSObject.Properties['sockets']) {
+        throw "Skeleton metadata has no sockets array: $($skeleton.objectPath)"
+    }
+    if (@($skeleton.metadata.bones).Count -ne $skeleton.metadata.boneCount) {
+        throw "Skeleton bone count does not match metadata: $($skeleton.objectPath)"
+    }
+}
+foreach ($animation in @($manifest.animations)) {
+    foreach ($field in @('loop', 'interpolation', 'forceRootLock', 'useNormalizedRootMotionScale',
+        'additiveBasePoseType', 'additiveBasePoseFrame', 'additiveBasePoseId', 'additiveBasePoseObjectPath')) {
+        if ($null -eq $animation.metadata.PSObject.Properties[$field]) {
+            throw "Animation metadata is missing '$field': $($animation.objectPath)"
+        }
+    }
+}
+if (@($manifest.montages | Where-Object { @($_.metadata.sections).Count -gt 0 }).Count -eq 0) {
+    throw 'Partial manifest contains no montage sections.'
+}
+foreach ($montage in @($manifest.montages)) {
+    foreach ($field in @('blendInTime', 'blendInOption', 'blendOutTime', 'blendOutOption',
+        'blendOutTriggerTime', 'enableAutoBlendOut')) {
+        if ($null -eq $montage.metadata.PSObject.Properties[$field]) {
+            throw "Montage metadata is missing '$field': $($montage.objectPath)"
+        }
+    }
+}
+if (@($manifest.blendSpaces + $manifest.aimOffsets | Where-Object { @($_.metadata.samples).Count -gt 0 }).Count -eq 0) {
+    throw 'Partial manifest contains no blend space or aim offset samples.'
+}
+if (@($manifest.physicsAssets | Where-Object { @($_.metadata.bodies).Count -gt 0 }).Count -eq 0) {
+    throw 'Partial manifest contains no physics bodies.'
+}
+foreach ($physicsAsset in @($manifest.physicsAssets)) {
+    if ($null -eq $physicsAsset.metadata.PSObject.Properties['constraints'] -or
+        @($physicsAsset.metadata.constraints).Count -ne $physicsAsset.metadata.constraintCount) {
+        throw "Physics asset constraints do not match metadata: $($physicsAsset.objectPath)"
+    }
+}
+if (@($manifest.animations | Where-Object { $_.objectPath -match '/Overlay/' }).Count -eq 0) {
+    throw 'Partial manifest contains no overlay animation.'
+}
+if (@($manifest.staticMeshes + $manifest.skeletalMeshes | Where-Object { $_.objectPath -match '/Props/' }).Count -eq 0) {
+    throw 'Partial manifest contains no prop mesh.'
+}
+$materialInstances = @($manifest.materials | Where-Object { $_.classPath -match 'MaterialInstance' })
+if ($materialInstances.Count -eq 0) {
+    throw 'Partial manifest contains no material instance.'
+}
+$materialOverrideCount = 0
+foreach ($materialInstance in $materialInstances) {
+    foreach ($field in @('scalarParameterOverrides', 'vectorParameterOverrides', 'textureParameterOverrides')) {
+        if ($null -eq $materialInstance.metadata.PSObject.Properties[$field]) {
+            throw "Material instance metadata is missing '$field': $($materialInstance.objectPath)"
+        }
+        $materialOverrideCount += @($materialInstance.metadata.$field).Count
+    }
+}
+if ($materialOverrideCount -eq 0) {
+    throw 'Partial manifest contains no material parameter overrides.'
+}
+if ($manifest.auditSummary.status -cne 'planned') {
+    throw "Unexpected dry-run audit status: $($manifest.auditSummary.status)"
+}
+Write-Host 'GODOT_ALS_P2A_METADATA_OK'
+
+Write-Host 'P2A: exporting assets and checking file hashes...'
+$exportOutput = & $editorCommand $UnrealProject "-run=$CommandletName" -Export "-Output=$outputPath" "-ContentRoot=$ContentRoot" -unattended -nop4 -nosplash -nosound -AllowCommandletRendering -RenderOffscreen 2>&1
+$exportOutput | ForEach-Object { Write-Host $_ }
+if ($LASTEXITCODE -ne 0) {
+    throw "P2A full export failed with exit code $LASTEXITCODE."
+}
+$exportMarker = 'GODOT_ALS_P2A_EXPORT_OK assets='
+if (-not (($exportOutput | Out-String).Contains($exportMarker, [StringComparison]::Ordinal))) {
+    throw "P2A full export marker was not found: $exportMarker"
+}
+
+$formalManifestPath = Join-Path $outputPath 'als_manifest.json'
+if (-not (Test-Path -LiteralPath $formalManifestPath -PathType Leaf)) {
+    throw "Formal manifest does not exist: $formalManifestPath"
+}
+$formalManifest = Read-AlsP2aManifestJson -ManifestPath $formalManifestPath -Label 'Formal'
+Assert-P2AV2Manifest -Manifest $formalManifest -Label 'Formal'
+if ($formalManifest.auditSummary.status -cne 'complete' -or $formalManifest.auditSummary.errorCount -ne 0) {
+    throw "Formal manifest audit is not complete: $($formalManifest.auditSummary.status)"
+}
+Assert-AlsP2aManifestFiles -Manifest $formalManifest -AssetRoot $outputPath -Label 'Formal'
+$fbxFiles = Get-ChildItem -LiteralPath $outputPath -Recurse -File -Filter '*.fbx'
+$externalTextureObjects = @($fbxFiles | Select-String -Pattern '^\s*(Texture|Video):\s+\d+,' -CaseSensitive)
+if ($externalTextureObjects.Count -ne 0) {
+    $firstMatch = $externalTextureObjects[0]
+    throw "Normalized FBX still contains an external texture object: $($firstMatch.Path):$($firstMatch.LineNumber)"
+}
+if (@($formalManifest.files).Count -ne $plan.summary.exportableCount) {
+    throw "Formal manifest file count does not match export plan: $(@($formalManifest.files).Count)"
+}
+Write-Host "GODOT_ALS_P2A_FULL_EXPORT_OK files=$(@($formalManifest.files).Count)"
+
+Write-Host 'P2A: repeating the export to verify deterministic output...'
+$determinismOutput = & $editorCommand $UnrealProject "-run=$CommandletName" -Export "-Output=$determinismPath" "-ContentRoot=$ContentRoot" -unattended -nop4 -nosplash -nosound -AllowCommandletRendering -RenderOffscreen 2>&1
+$determinismOutput | ForEach-Object { Write-Host $_ }
+if ($LASTEXITCODE -ne 0) {
+    throw "P2A determinism export failed with exit code $LASTEXITCODE."
+}
+}
+$compareScript = Join-Path $PSScriptRoot 'compare-p2a-exports.ps1'
+Invoke-AlsP2aPublication -GateToken 'P2A_EXPORT_GATES_COMPLETE' `
+    -RepositoryRoot $repositoryRoot -CanonicalRoot $canonicalPath -CandidateRoot $outputPath `
+    -DeterminismRoot $determinismPath `
+    -CanonicalBackupRoot $canonicalBackupPath -JournalPath $journalPath `
+    -ComparisonScriptPath $compareScript
+Write-Host 'P2A_VERIFICATION_OK'
