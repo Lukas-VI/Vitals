@@ -5,6 +5,7 @@
 - `main`：Vitals 游戏开发分支。
 - `template`：可复用的 Godot ALS + Lyra TPS/FPS 模板基线。
 - 仓库只包含 MIT 代码，不包含 ALS、Lyra 或 UE 导出的模型、动画、数值数据；运行时资源请按下方说明从 Release 下载。资源的使用范围见 `ASSET_LICENSE.md`。
+- `assets/config/` 同样不随仓库分发，需要从上游 `v0.2.1-lyra` 源码获取后放回该目录，否则场景无法加载。
 - 模板默认入口为 `res://scenes/demo/als_demo.tscn`（F6 切换 ALS / Lyra）；纯 ALS 入口为 `res://scenes/template/als_only_demo.tscn`。
 
 ## Lyra Release：资源配置与测试
